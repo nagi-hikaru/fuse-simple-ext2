@@ -34,7 +34,7 @@ static struct fuse_operations operations = {
 	.read = newfs_read,                      /* 附加题一：未完成时返回 ENOSYS */
 	.utimens = newfs_utimens,				 /* 修改时间，忽略，避免touch报错 */
 	.truncate = NULL,						 /* 改变文件大小 */
-	.unlink = NULL,							 /* 删除文件 */
+	.unlink = newfs_unlink,					 /* 删除文件 */
 	.rmdir	= NULL,							 /* 删除目录， rm -r */
 	.rename = NULL,							 /* 重命名，mv */
 
@@ -653,14 +653,59 @@ int newfs_read(const char* path, char* buf, size_t size, off_t offset,
 }
 
 /**
- * @brief 删除文件
- * 
- * @param path 相对于挂载点的路径
- * @return int 0成功，否则返回对应错误号
+ * @brief 删除普通文件，移除目录项并回收 inode 和数据块。
+ * @param path 相对于文件系统根目录的绝对路径
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_unlink(const char* path) {
-	/* 选做 */
-	return 0;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EISDIR;
+
+    // 找到父目录，以及保存该文件名的目录项
+    const char *name = strrchr(path, '/') + 1;
+    char *parent_path = name == path + 1 ? strdup("/") : strndup(path, name - path - 1);
+    if (!parent_path)
+        return -ENOMEM;
+    struct newfs_inode *parent;
+    result = lookup(parent_path, &parent);
+    free(parent_path);
+    if (result < 0)
+        return result;
+
+    struct newfs_dentry **entry = &parent->children;
+    while (*entry && strcmp((*entry)->name, name))
+        entry = &(*entry)->next;
+    if (!*entry)
+        return -ENOENT;
+
+    // 从链表中摘下目录项
+    struct newfs_dentry *removed = *entry;
+    *entry = removed->next;
+    parent->dir_cnt--;
+    parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
+
+    // 回收文件占用的数据块和 inode 编号
+    for (uint32_t i = 0; i < inode->block_count; i++) {
+        int block = inode->data_block[i];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+    }
+    super.ino_map[inode->ino / 8] &= (uint8_t)~(1u << (inode->ino % 8));
+    free(inode);
+    free(removed);
+
+    // 目录项减少后，释放父目录末尾不再需要的数据块
+    uint32_t needed_blocks = (parent->dir_cnt + NEWFS_DENTRIES_PER_BLOCK - 1)
+                             / NEWFS_DENTRIES_PER_BLOCK;
+    while (parent->block_count > needed_blocks) {
+        int block = parent->data_block[--parent->block_count];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+        parent->data_block[parent->block_count] = 0;
+    }
+    return 0;
 }
 
 /**
