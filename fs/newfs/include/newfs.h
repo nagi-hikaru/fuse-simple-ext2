@@ -14,7 +14,17 @@
 #include "types.h"
 #include "stdint.h"
 
-#define NEWFS_MAGIC                  /* TODO: Define by yourself */
+#define NEWFS_MAGIC           69
+
+
+#define NEWFS_BLOCK_SIZE 	    1024
+#define NEWFS_INODE_BLOCKS      33
+#define NEWFS_INODE_LIMIT       676
+#define NEWFS_DIRECT_BLOCKS     6
+
+#define NEWFS_INODES_PER_BLOCK  (NEWFS_BLOCK_SIZE / sizeof(struct newfs_inode_d))
+#define NEWFS_DENTRIES_PER_BLOCK (NEWFS_BLOCK_SIZE / sizeof(struct newfs_dentry_d))
+
 #define NEWFS_DEFAULT_PERM    0777   /* 全权限打开 */
 
 /******************************************************************************
