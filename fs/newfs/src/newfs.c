@@ -35,7 +35,7 @@ static struct fuse_operations operations = {
 	.utimens = newfs_utimens,				 /* 修改时间，忽略，避免touch报错 */
 	.truncate = NULL,						 /* 改变文件大小 */
 	.unlink = newfs_unlink,					 /* 删除文件 */
-	.rmdir	= NULL,							 /* 删除目录， rm -r */
+	.rmdir = newfs_rmdir,					 /* 删除空目录 */
 	.rename = NULL,							 /* 重命名，mv */
 
 	.open = NULL,							
@@ -255,6 +255,31 @@ static int lookup(const char *path, struct newfs_inode **out) {
     return 0;
 }
 
+// 查找 path 的父目录 inode，根目录没有父目录，返回 -EINVAL
+static int lookup_parent(const char *path, struct newfs_inode **parent) {
+    if (!path || path[0] != '/')
+        return -EINVAL;
+
+    const char *name = path + strlen(path);
+    while (name > path + 1 && name[-1] == '/')
+        name--;
+    if (name == path + 1)
+        return -EINVAL;
+    while (name[-1] != '/')
+        name--;
+
+    char *parent_path = name == path + 1 ? strdup("/") : strndup(path, name - path - 1);
+    if (!parent_path)
+        return -ENOMEM;
+    int result = lookup(parent_path, parent);
+    free(parent_path);
+    if (result < 0)
+        return result;
+    if ((*parent)->ftype != NEWFS_DIR)
+        return -ENOTDIR;
+    return 0;
+}
+
 // 创建目录或普通文件
 static int create_node(const char *path, FILE_TYPE type) {
     if (!path || path[0] != '/')
@@ -269,16 +294,10 @@ static int create_node(const char *path, FILE_TYPE type) {
         return -EINVAL;
 
     // 获取 parent 的 inode
-    char *parent_path = name == path + 1 ? strdup("/") : strndup(path, name - path - 1);
-    if (!parent_path)
-        return -ENOMEM;
     struct newfs_inode *parent;
-    int result = lookup(parent_path, &parent);
-    free(parent_path);
+    int result = lookup_parent(path, &parent);
     if (result < 0)
         return result;
-    if (parent->ftype != NEWFS_DIR)
-        return -ENOTDIR;
 
     // 寻找是否已经存在
     struct newfs_dentry **tail = &parent->children;
@@ -327,6 +346,36 @@ static int create_node(const char *path, FILE_TYPE type) {
     parent->dir_cnt++;
     parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
     return 0;
+}
+
+// 回收 inode 和它的数据块
+static void drop_inode(struct newfs_inode *inode) {
+    // 归还数据位图
+    for (uint32_t i = 0; i < inode->block_count; i++) {
+        int block = inode->data_block[i];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+    }
+    // 归还 inode 位图
+    super.ino_map[inode->ino / 8] &= (uint8_t)~(1u << (inode->ino % 8));
+    free(inode);
+}
+
+// entry 指向链表中保存目标目录项指针的位置，只移除目录项，不释放 inode
+static void drop_dentry(struct newfs_inode *parent, struct newfs_dentry **entry) {
+    struct newfs_dentry *removed = *entry;
+    *entry = removed->next;
+    free(removed);
+    parent->dir_cnt--;
+    parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
+
+    // 目录项减少后，释放父目录末尾不再需要的数据块
+    uint32_t needed_blocks = (parent->dir_cnt + NEWFS_DENTRIES_PER_BLOCK - 1)
+                             / NEWFS_DENTRIES_PER_BLOCK;
+    while (parent->block_count > needed_blocks) {
+        int block = parent->data_block[--parent->block_count];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+        parent->data_block[parent->block_count] = 0;
+    }
 }
 
 // 同步目录树
@@ -666,63 +715,54 @@ int newfs_unlink(const char* path) {
         return -EISDIR;
 
     // 找到父目录，以及保存该文件名的目录项
-    const char *name = strrchr(path, '/') + 1;
-    char *parent_path = name == path + 1 ? strdup("/") : strndup(path, name - path - 1);
-    if (!parent_path)
-        return -ENOMEM;
     struct newfs_inode *parent;
-    result = lookup(parent_path, &parent);
-    free(parent_path);
+    result = lookup_parent(path, &parent);
     if (result < 0)
         return result;
 
+    const char *name = strrchr(path, '/') + 1;
     struct newfs_dentry **entry = &parent->children;
     while (*entry && strcmp((*entry)->name, name))
         entry = &(*entry)->next;
     if (!*entry)
         return -ENOENT;
 
-    // 从链表中摘下目录项
-    struct newfs_dentry *removed = *entry;
-    *entry = removed->next;
-    parent->dir_cnt--;
-    parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
-
-    // 回收文件占用的数据块和 inode 编号
-    for (uint32_t i = 0; i < inode->block_count; i++) {
-        int block = inode->data_block[i];
-        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
-    }
-    super.ino_map[inode->ino / 8] &= (uint8_t)~(1u << (inode->ino % 8));
-    free(inode);
-    free(removed);
-
-    // 目录项减少后，释放父目录末尾不再需要的数据块
-    uint32_t needed_blocks = (parent->dir_cnt + NEWFS_DENTRIES_PER_BLOCK - 1)
-                             / NEWFS_DENTRIES_PER_BLOCK;
-    while (parent->block_count > needed_blocks) {
-        int block = parent->data_block[--parent->block_count];
-        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
-        parent->data_block[parent->block_count] = 0;
-    }
+    drop_dentry(parent, entry);
+    drop_inode(inode);
     return 0;
 }
 
 /**
- * @brief 删除目录
- * 
- * 一个可能的删除目录操作如下：
- * rm ./tests/mnt/j/ -r
- *  1) Step 1. rm ./tests/mnt/j/j
- *  2) Step 2. rm ./tests/mnt/j
- * 即，先删除最深层的文件，再删除目录文件本身
- * 
- * @param path 相对于挂载点的路径
- * @return int 0成功，否则返回对应错误号
+ * @brief 删除空目录，非空目录返回 -ENOTEMPTY，根目录不可删除。
+ * @param path 相对于文件系统根目录的绝对路径
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_rmdir(const char* path) {
-	/* 选做 */
-	return 0;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype != NEWFS_DIR)
+        return -ENOTDIR;
+    if (inode == super.root_inode)
+        return -EBUSY;
+    if (inode->children || inode->dir_cnt != 0)
+        return -ENOTEMPTY;
+
+    struct newfs_inode *parent;
+    result = lookup_parent(path, &parent);
+    if (result < 0)
+        return result;
+
+    struct newfs_dentry **entry = &parent->children;
+    while (*entry && (*entry)->inode != inode)
+        entry = &(*entry)->next;
+    if (!*entry)
+        return -ENOENT;
+
+    drop_dentry(parent, entry);
+    drop_inode(inode);
+    return 0;
 }
 
 /**
