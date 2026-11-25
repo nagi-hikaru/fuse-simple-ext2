@@ -36,7 +36,7 @@ static struct fuse_operations operations = {
 	.truncate = NULL,						 /* 改变文件大小 */
 	.unlink = newfs_unlink,					 /* 删除文件 */
 	.rmdir = newfs_rmdir,					 /* 删除空目录 */
-	.rename = NULL,							 /* 重命名，mv */
+	.rename = newfs_rename,					 /* 重命名，mv */
 
 	.open = NULL,							
 	.opendir = NULL,
@@ -376,6 +376,17 @@ static void drop_dentry(struct newfs_inode *parent, struct newfs_dentry **entry)
         super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
         parent->data_block[parent->block_count] = 0;
     }
+}
+
+// 判断 target 是否位于 root 的目录树中，包含 root 自身
+static int contains_inode(const struct newfs_inode *root, const struct newfs_inode *target) {
+    if (root == target)
+        return 1;
+    for (struct newfs_dentry *child = root->children; child; child = child->next) {
+        if (contains_inode(child->inode, target))
+            return 1;
+    }
+    return 0;
 }
 
 // 同步目录树
@@ -766,15 +777,128 @@ int newfs_rmdir(const char* path) {
 }
 
 /**
- * @brief 重命名文件 
- * 
- * @param from 源文件路径
- * @param to 目标文件路径
- * @return int 0成功，否则返回对应错误号
+ * @brief 重命名或移动文件、目录，保留源 inode，可替换同类型文件或空目录。
+ * @param from 源文件或目录的绝对路径
+ * @param to 目标绝对路径，包含新名字
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_rename(const char* from, const char* to) {
-	/* 选做 */
-	return 0;
+    struct newfs_inode *inode;
+    int result = lookup(from, &inode);
+    if (result < 0)
+        return result;
+    if (inode == super.root_inode)
+        return -EBUSY;
+    if (!to || to[0] != '/')
+        return -EINVAL;
+
+    // 提取新旧文件名，目录路径允许带末尾斜杠
+    const char *from_end = from + strlen(from);
+    while (from_end[-1] == '/')
+        from_end--;
+    const char *from_name = from_end;
+    while (from_name[-1] != '/')
+        from_name--;
+    size_t from_length = from_end - from_name;
+
+    const char *to_end = to + strlen(to);
+    while (to_end > to + 1 && to_end[-1] == '/')
+        to_end--;
+    if (to_end == to + 1)
+        return -EBUSY;
+    if (*to_end == '/' && inode->ftype != NEWFS_DIR)
+        return -ENOTDIR;
+    const char *to_name = to_end;
+    while (to_name[-1] != '/')
+        to_name--;
+    size_t to_length = to_end - to_name;
+    if (to_length >= MAX_NAME_LEN)
+        return -ENAMETOOLONG;
+    if ((to_length == 1 && to_name[0] == '.') ||
+        (to_length == 2 && to_name[0] == '.' && to_name[1] == '.'))
+        return -EINVAL;
+
+    // 获取新旧文件的父 inode
+    struct newfs_inode *from_parent, *to_parent;
+    result = lookup_parent(from, &from_parent);
+    if (result < 0)
+        return result;
+    result = lookup_parent(to, &to_parent);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR && contains_inode(inode, to_parent))
+        return -EINVAL;
+
+    // 获取新旧文件的 entry
+    struct newfs_dentry **from_entry = &from_parent->children;
+    while (*from_entry && (strlen((*from_entry)->name) != from_length ||
+                           memcmp((*from_entry)->name, from_name, from_length)))
+        from_entry = &(*from_entry)->next;
+    if (!*from_entry)
+        return -ENOENT;
+    struct newfs_dentry *source = *from_entry;
+
+    struct newfs_dentry **to_entry = &to_parent->children;
+    while (*to_entry && (strlen((*to_entry)->name) != to_length ||
+                         memcmp((*to_entry)->name, to_name, to_length)))
+        to_entry = &(*to_entry)->next;
+    struct newfs_dentry *target = *to_entry;
+    // 判断是否允许覆盖
+    if (target) {
+        if (target->inode == inode)
+            return 0;
+        if (inode->ftype == NEWFS_DIR && target->ftype != NEWFS_DIR)
+            return -ENOTDIR;
+        if (inode->ftype != NEWFS_DIR && target->ftype == NEWFS_DIR)
+            return -EISDIR;
+        if (target->ftype == NEWFS_DIR &&
+            (target->inode->children || target->inode->dir_cnt != 0))
+            return -ENOTEMPTY;
+    }
+
+    // 同一父目录中直接改名，无需为源文件再分配目录项或 inode
+    if (from_parent == to_parent) {
+        if (target) {
+            struct newfs_inode *old_inode = target->inode;
+            drop_dentry(to_parent, to_entry);
+            drop_inode(old_inode);
+        }
+        memcpy(source->name, to_name, to_length);
+        source->name[to_length] = '\0';
+        return 0;
+    }
+
+    if (target) {
+        // 跨目录覆盖时，复用目标目录项，回收旧目标的 inode
+        struct newfs_inode *old_inode = target->inode;
+        target->inode = inode;
+        drop_dentry(from_parent, from_entry);
+        drop_inode(old_inode);
+    } else {
+        if (to_parent->dir_cnt >= NEWFS_DIRECT_BLOCKS * NEWFS_DENTRIES_PER_BLOCK)
+            return -ENOSPC;
+        struct newfs_dentry *entry = calloc(1, sizeof(*entry));
+        if (!entry)
+            return -ENOMEM;
+        memcpy(entry->name, to_name, to_length);
+        entry->ftype = source->ftype;
+        entry->inode = inode;
+
+        // 所有可能失败的分配先完成，失败时保留原路径及其内容
+        if (to_parent->dir_cnt % NEWFS_DENTRIES_PER_BLOCK == 0) {
+            int block = alloc_bitmap(super.data_map, super.data_blks);
+            if (block < 0) {
+                free(entry);
+                return block;
+            }
+            to_parent->data_block[to_parent->block_count++] = block;
+        }
+        *to_entry = entry;
+        to_parent->dir_cnt++;
+        to_parent->size = to_parent->dir_cnt * sizeof(struct newfs_dentry_d);
+        drop_dentry(from_parent, from_entry);
+    }
+    return 0;
 }
 
 /**
