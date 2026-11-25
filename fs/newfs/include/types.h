@@ -85,6 +85,9 @@ struct newfs_inode {
     uint32_t size;
     uint32_t block_count;
     int data_block[6];
+    char *data[6];                    // 普通文件的逐块缓存，NULL 表示该块尚未加载
+    uint8_t dirty[6];                 // 对应缓存块是否被修改，需要写回
+
     struct newfs_dentry *children;
 };
 

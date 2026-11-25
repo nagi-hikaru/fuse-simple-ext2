@@ -30,10 +30,10 @@ static struct fuse_operations operations = {
 	.getattr = newfs_getattr,				 /* 获取文件属性，类似stat，必须完成 */
 	.readdir = newfs_readdir,				 /* 填充dentrys */
 	.mknod = newfs_mknod,					 /* 创建文件，touch相关 */
-	.write = NULL,							 /* 写入文件 */
-	.read = newfs_read,                      /* 附加题一：未完成时返回 ENOSYS */
+	.write = newfs_write,					 /* 写入文件 */
+	.read = newfs_read,					     /* 读取文件 */
 	.utimens = newfs_utimens,				 /* 修改时间，忽略，避免touch报错 */
-	.truncate = NULL,						 /* 改变文件大小 */
+	.truncate = newfs_truncate,				 /* 改变文件大小 */
 	.unlink = newfs_unlink,					 /* 删除文件 */
 	.rmdir = newfs_rmdir,					 /* 删除空目录 */
 	.rename = newfs_rename,					 /* 重命名，mv */
@@ -128,6 +128,30 @@ static int write_inode(const struct newfs_inode_d *inode) {
     return write_disk(offset, inode, sizeof(*inode));
 }
 
+// 首次访问时加载一个文件块，文件末尾以外补零
+static int load_file_block(struct newfs_inode *inode, uint32_t block) {
+    if (inode->data[block])
+        return 0;
+    char *buf = calloc(1, NEWFS_BLOCK_SIZE);
+    if (!buf)
+        return -ENOMEM;
+
+    uint32_t start = block * NEWFS_BLOCK_SIZE;
+    if (start < inode->size) {
+        size_t count = inode->size - start;
+        if (count > NEWFS_BLOCK_SIZE)
+            count = NEWFS_BLOCK_SIZE;
+        off_t offset = (off_t)(super.data_offset + inode->data_block[block]) * NEWFS_BLOCK_SIZE;
+        int result = read_disk(offset, buf, count);
+        if (result < 0) {
+            free(buf);
+            return result;
+        }
+    }
+    inode->data[block] = buf;
+    return 0;
+}
+
 // 递归加载目录树，并组织成内存 inode 结构
 static int load_subtree(uint32_t ino, uint8_t *visited, struct newfs_inode **out) {
     if (ino >= (uint32_t)super.ino_max || visited[ino] ||
@@ -145,7 +169,9 @@ static int load_subtree(uint32_t ino, uint8_t *visited, struct newfs_inode **out
         disk_inode.block_count > NEWFS_DIRECT_BLOCKS ||
         disk_inode.size > (uint32_t)super.file_max || disk_inode.dir_cnt < 0 ||
         (uint32_t)disk_inode.dir_cnt > disk_inode.block_count * NEWFS_DENTRIES_PER_BLOCK ||
-        (disk_inode.ftype == NEWFS_FILE && disk_inode.dir_cnt != 0))
+        (disk_inode.ftype == NEWFS_FILE &&
+         (disk_inode.dir_cnt != 0 ||
+          disk_inode.size > disk_inode.block_count * NEWFS_BLOCK_SIZE)))
         return -EIO;
 
     for (uint32_t i = 0; i < disk_inode.block_count; i++) {
@@ -221,6 +247,90 @@ static int alloc_bitmap(uint8_t *map, int limit) {
         }
     }
     return -ENOSPC;
+}
+
+// 调整普通文件大小，调用方须检查类型和容量；分配失败时撤销本次新增的数据块
+static int resize_file(struct newfs_inode *inode, uint32_t size) {
+    uint32_t old_size = inode->size;
+    uint32_t old_blocks = inode->block_count;
+    uint32_t needed_blocks = (size + NEWFS_BLOCK_SIZE - 1) / NEWFS_BLOCK_SIZE;
+
+    char *new_data[NEWFS_DIRECT_BLOCKS] = {0};
+    uint32_t tail = old_size / NEWFS_BLOCK_SIZE;
+    int needs_tail = size > old_size && old_size % NEWFS_BLOCK_SIZE != 0;
+    int tail_loaded = 0;  // 记录是否是本次加载的缓存，失败路径使用
+    int result;
+
+    // 先申请空闲编号，空间不足时无需为新块分配缓存
+    while (inode->block_count < needed_blocks) {
+        int block = alloc_bitmap(super.data_map, super.data_blks);
+        if (block < 0) {
+            result = block;
+            goto fail;
+        }
+        inode->data_block[inode->block_count++] = block;
+    }
+
+    // 编号申请成功后，再加载需要处理的旧尾块
+    if (needs_tail && !inode->data[tail]) {
+        result = load_file_block(inode, tail);
+        if (result < 0)
+            goto fail;
+        tail_loaded = 1;
+    }
+
+    // 再准备新块的全零缓存，分配全部成功后再修改文件内容和大小
+    for (uint32_t block = old_blocks; block < needed_blocks; block++) {
+        if (!inode->data[block]) {
+            new_data[block] = calloc(1, NEWFS_BLOCK_SIZE);
+            if (!new_data[block]) {
+                result = -ENOMEM;
+                goto fail;
+            }
+        }
+    }
+    for (uint32_t block = old_blocks; block < needed_blocks; block++) {
+        if (new_data[block])
+            inode->data[block] = new_data[block];
+        inode->dirty[block] = 1;
+    }
+
+    // 截断逻辑
+    while (inode->block_count > needed_blocks) {
+        uint32_t slot = --inode->block_count;
+        int block = inode->data_block[slot];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+        inode->data_block[slot] = 0;
+        free(inode->data[slot]);
+        inode->data[slot] = NULL;
+        inode->dirty[slot] = 0;
+    }
+
+    // 清零多余部分
+    if (needs_tail) {
+        uint32_t offset = old_size % NEWFS_BLOCK_SIZE;
+        uint32_t count = NEWFS_BLOCK_SIZE - offset;
+        if (count > size - old_size)
+            count = size - old_size;
+        memset(inode->data[tail] + offset, 0, count);
+        inode->dirty[tail] = 1;
+    }
+    inode->size = size;
+    return 0;
+
+fail:
+    while (inode->block_count > old_blocks) {
+        int block = inode->data_block[--inode->block_count];
+        super.data_map[block / 8] &= (uint8_t)~(1u << (block % 8));
+        inode->data_block[inode->block_count] = 0;
+    }
+    for (int block = 0; block < NEWFS_DIRECT_BLOCKS; block++)
+        free(new_data[block]);
+    if (tail_loaded) {
+        free(inode->data[tail]);
+        inode->data[tail] = NULL;
+    }
+    return result;
 }
 
 // 根据 path 在目录树中查找对应 inode
@@ -357,6 +467,8 @@ static void drop_inode(struct newfs_inode *inode) {
     }
     // 归还 inode 位图
     super.ino_map[inode->ino / 8] &= (uint8_t)~(1u << (inode->ino % 8));
+    for (int i = 0; i < NEWFS_DIRECT_BLOCKS; i++)
+        free(inode->data[i]);
     free(inode);
 }
 
@@ -418,6 +530,19 @@ static int sync_tree(const struct newfs_inode *inode) {
         }
     }
 
+    // 普通文件只写回修改过的块，未加载且未改变的块保持盘上内容
+    else if (inode->ftype == NEWFS_FILE) {
+        for (uint32_t block = 0; block < inode->block_count; block++) {
+            if (!inode->dirty[block])
+                continue;
+
+            off_t offset = (off_t)(super.data_offset + inode->data_block[block]) * NEWFS_BLOCK_SIZE;
+            int result = write_disk(offset, inode->data[block], NEWFS_BLOCK_SIZE);
+            if (result < 0)
+                return result;
+        }
+    }
+
     // 写回 inode
     struct newfs_inode_d disk_inode = {
         .ino = inode->ino,
@@ -442,6 +567,8 @@ static void free_tree(struct newfs_inode *inode) {
         free(child);
         child = next;
     }
+    for (int i = 0; i < NEWFS_DIRECT_BLOCKS; i++)
+        free(inode->data[i]);
     free(inode);
 }
 
@@ -681,35 +808,116 @@ int newfs_utimens(const char *path, const struct timespec tv[2]) {
 * SECTION: 选做函数实现
 *******************************************************************************/
 /**
- * @brief 写入文件
+ * @brief 按块缓存并写入普通文件，按需分配数据块，修改内容在卸载时写回。
  * 
  * @param path 相对于挂载点的路径
  * @param buf 写入的内容
  * @param size 写入的字节数
  * @param offset 相对文件的偏移
  * @param fi 可忽略
- * @return int 写入大小
+ * @return int 成功返回写入字节数，失败返回负错误码
  */
 int newfs_write(const char* path, const char* buf, size_t size, off_t offset,
 		        struct fuse_file_info* fi) {
-	/* 选做 */
-	return size;
+    (void)fi;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EISDIR;
+    if (offset < 0)
+        return -EINVAL;
+    if (size == 0)
+        return 0;
+    if (offset > super.file_max || size > (size_t)(super.file_max - offset))
+        return -EFBIG;
+
+    uint32_t end = (uint32_t)offset + size;
+    uint32_t first = offset / NEWFS_BLOCK_SIZE;
+    uint32_t last = (end - 1) / NEWFS_BLOCK_SIZE;
+    uint8_t loaded[NEWFS_DIRECT_BLOCKS] = {0};
+    // 先准备涉及的缓存块，失败时撤销本次缓存分配，原内容和大小不变
+    for (uint32_t block = first; block <= last; block++) {
+        if (!inode->data[block]) {
+            result = load_file_block(inode, block);
+            if (result < 0)
+                goto fail;
+            loaded[block] = 1;
+        }
+    }
+    if (end > inode->size) {
+        result = resize_file(inode, end);
+        if (result < 0)
+            goto fail;
+    }
+
+    size_t done = 0;
+    while (done < size) {
+        uint32_t block = offset / NEWFS_BLOCK_SIZE;
+        size_t offset_in_block = offset % NEWFS_BLOCK_SIZE;
+        size_t count = NEWFS_BLOCK_SIZE - offset_in_block;
+        if (count > size - done)
+            count = size - done;
+        memcpy(inode->data[block] + offset_in_block, buf + done, count);
+        inode->dirty[block] = 1;
+        offset += count;
+        done += count;
+    }
+    return (int)size;
+
+fail:
+    for (uint32_t block = first; block <= last; block++) {
+        if (loaded[block]) {
+            free(inode->data[block]);
+            inode->data[block] = NULL;
+        }
+    }
+    return result;
 }
 
 /**
- * @brief 读取文件
+ * @brief 按需加载并读取普通文件的数据块，读取到文件末尾时返回 0。
  * 
  * @param path 相对于挂载点的路径
  * @param buf 读取的内容
  * @param size 读取的字节数
  * @param offset 相对文件的偏移
  * @param fi 可忽略
- * @return int 读取大小
+ * @return int 成功返回实际读取字节数，失败返回负错误码
  */
 int newfs_read(const char* path, char* buf, size_t size, off_t offset,
 		       struct fuse_file_info* fi) {
-	/* 附加题一：完成普通文件读取，供 FUSE 和附加题复用。 */
-	return -ENOSYS;
+    (void)fi;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EISDIR;
+    if (offset < 0)
+        return -EINVAL;
+    if (size == 0 || offset >= inode->size)
+        return 0;
+
+    size_t remaining = inode->size - offset;
+    if (size > remaining)
+        size = remaining;
+    size_t done = 0;
+    while (done < size) {
+        uint32_t block = offset / NEWFS_BLOCK_SIZE;
+        result = load_file_block(inode, block);
+        if (result < 0)
+            return done > 0 ? (int)done : result;
+        size_t offset_in_block = offset % NEWFS_BLOCK_SIZE;
+        size_t count = NEWFS_BLOCK_SIZE - offset_in_block;
+        if (count > size - done)
+            count = size - done;
+        memcpy(buf + done, inode->data[block] + offset_in_block, count);
+        offset += count;
+        done += count;
+    }
+    return (int)done;
 }
 
 /**
@@ -927,15 +1135,23 @@ int newfs_opendir(const char* path, struct fuse_file_info* fi) {
 }
 
 /**
- * @brief 改变文件大小
- * 
- * @param path 相对于挂载点的路径
- * @param offset 改变后文件大小
- * @return int 0成功，否则返回对应错误号
+ * @brief 调整普通文件大小，扩大时补零，缩小时回收多余数据块。
+ * @param path 相对于文件系统根目录的绝对路径
+ * @param offset 改变后的文件大小，单位为字节
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_truncate(const char* path, off_t offset) {
-	/* 选做 */
-	return 0;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EISDIR;
+    if (offset < 0)
+        return -EINVAL;
+    if (offset > super.file_max)
+        return -EFBIG;
+    return resize_file(inode, (uint32_t)offset);
 }
 
 
