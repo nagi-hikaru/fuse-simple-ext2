@@ -38,9 +38,9 @@ static struct fuse_operations operations = {
 	.rmdir = newfs_rmdir,					 /* 删除空目录 */
 	.rename = newfs_rename,					 /* 重命名，mv */
 
-	.open = NULL,							
-	.opendir = NULL,
-	.access = NULL
+	.open = newfs_open,
+	.opendir = newfs_opendir,
+	.access = newfs_access
 };
 /******************************************************************************
 * SECTION: 辅助函数实现
@@ -1151,28 +1151,37 @@ int newfs_rename(const char* from, const char* to) {
 }
 
 /**
- * @brief 打开文件，可以在这里维护fi的信息，例如，fi->fh可以理解为一个64位指针，可以把自己想保存的数据结构
- * 保存在fh中
- * 
- * @param path 相对于挂载点的路径
- * @param fi 文件信息
- * @return int 0成功，否则返回对应错误号
+ * @brief 打开普通文件，检查路径存在及类型，内容仍在读写时按需加载。
+ * @param path 相对于文件系统根目录的绝对路径
+ * @param fi 文件信息，当前忽略
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_open(const char* path, struct fuse_file_info* fi) {
-	/* 选做 */
-	return 0;
+    (void)fi;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EISDIR;
+    return 0;
 }
 
 /**
- * @brief 打开目录文件
- * 
- * @param path 相对于挂载点的路径
- * @param fi 文件信息
- * @return int 0成功，否则返回对应错误号
+ * @brief 打开目录并检查类型，子项仍在查找或列举时按需加载。
+ * @param path 相对于文件系统根目录的绝对路径
+ * @param fi 文件信息，当前忽略
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_opendir(const char* path, struct fuse_file_info* fi) {
-	/* 选做 */
-	return 0;
+    (void)fi;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype != NEWFS_DIR)
+        return -ENOTDIR;
+    return 0;
 }
 
 /**
@@ -1197,20 +1206,29 @@ int newfs_truncate(const char* path, off_t offset) {
 
 
 /**
- * @brief 访问文件，因为读写文件时需要查看权限
+ * @brief 检查路径是否存在及请求的访问权限，使用 getattr 报告的默认权限。
  * 
- * @param path 相对于挂载点的路径
+ * @param path 相对于文件系统根目录的绝对路径
  * @param type 访问类别
  * R_OK: Test for read permission. 
  * W_OK: Test for write permission.
  * X_OK: Test for execute permission.
  * F_OK: Test for existence. 
  * 
- * @return int 0成功，否则返回对应错误号
+ * @return int 成功返回 0，失败返回负错误码
  */
 int newfs_access(const char* path, int type) {
-	/* 选做: 解析路径，判断是否存在 */
-	return 0;
+    if (type & ~(R_OK | W_OK | X_OK))
+        return -EINVAL;
+    struct stat st;
+    int result = newfs_getattr(path, &st);
+    if (result < 0)
+        return result;
+    if (((type & R_OK) && !(st.st_mode & 0444)) ||
+        ((type & W_OK) && !(st.st_mode & 0222)) ||
+        ((type & X_OK) && !(st.st_mode & 0111)))
+        return -EACCES;
+    return 0;
 }	
 /******************************************************************************
 * SECTION: FUSE入口
