@@ -152,12 +152,27 @@ static int load_file_block(struct newfs_inode *inode, uint32_t block) {
     return 0;
 }
 
-// 递归加载目录树，并组织成内存 inode 结构
-static int load_subtree(uint32_t ino, uint8_t *visited, struct newfs_inode **out) {
-    if (ino >= (uint32_t)super.ino_max || visited[ino] ||
+// 递归释放内存中的 inode 和 dentry 树
+static void free_tree(struct newfs_inode *inode) {
+    if (!inode)
+        return;
+    struct newfs_dentry *child = inode->children;
+    while (child) {
+        struct newfs_dentry *next = child->next;
+        free_tree(child->inode);
+        free(child);
+        child = next;
+    }
+    for (int i = 0; i < NEWFS_DIRECT_BLOCKS; i++)
+        free(inode->data[i]);
+    free(inode);
+}
+
+// 加载一个 inode 的元数据
+static int load_inode(uint32_t ino, struct newfs_inode **out) {
+    if (ino >= (uint32_t)super.ino_max ||
         !(super.ino_map[ino / 8] & (1u << (ino % 8))))
         return -EIO;
-    visited[ino] = 1;
 
     // 读取对应 inode
     struct newfs_inode_d disk_inode;
@@ -192,16 +207,27 @@ static int load_subtree(uint32_t ino, uint8_t *visited, struct newfs_inode **out
     inode->size = disk_inode.size;
     inode->block_count = disk_inode.block_count;
     memcpy(inode->data_block, disk_inode.data_block, sizeof(inode->data_block));
+    return 0;
+}
 
+// 加载本目录的子项和它们的 inode 元数据
+static int load_directory(struct newfs_inode *inode) {
+    if (inode->ftype != NEWFS_DIR)
+        return -ENOTDIR;
+    if (inode->children_loaded)
+        return 0;
+
+    int result;
+    struct newfs_dentry *children = NULL;
     int remaining = inode->dir_cnt;
-    struct newfs_dentry **tail = &inode->children;
+    struct newfs_dentry **tail = &children;
     for (uint32_t block = 0; remaining > 0; block++) {
         // 遍历数据块
         char buf[NEWFS_BLOCK_SIZE];
         off_t offset = (off_t)(super.data_offset + inode->data_block[block]) * NEWFS_BLOCK_SIZE;
         result = read_disk(offset, buf, sizeof(buf));
         if (result < 0)
-            return result;
+            goto fail;
 
         // 遍历目录项
         for (int slot = 0; slot < NEWFS_DENTRIES_PER_BLOCK && remaining > 0; slot++, remaining--) {
@@ -210,31 +236,52 @@ static int load_subtree(uint32_t ino, uint8_t *visited, struct newfs_inode **out
             if (!entry.file_name[0] ||
                 !memchr(entry.file_name, '\0', sizeof(entry.file_name)) ||
                 strchr(entry.file_name, '/') || !strcmp(entry.file_name, ".") ||
-                !strcmp(entry.file_name, ".."))
-                return -EIO;
+                !strcmp(entry.file_name, "..")) {
+                result = -EIO;
+                goto fail;
+            }
+            // 子项不能指向本目录或祖先目录，避免盘上目录循环
+            for (struct newfs_inode *parent = inode; parent; parent = parent->parent) {
+                if (entry.ino == parent->ino) {
+                    result = -EIO;
+                    goto fail;
+                }
+            }
 
             struct newfs_dentry *child = calloc(1, sizeof(*child));
-            if (!child)
-                return -ENOMEM;
+            if (!child) {
+                result = -ENOMEM;
+                goto fail;
+            }
             memcpy(child->name, entry.file_name, sizeof(child->name));
             child->ftype = entry.ftype;
             *tail = child;
             tail = &child->next;
 
-            result = load_subtree(entry.ino, visited, &child->inode);
+            result = load_inode(entry.ino, &child->inode);
             if (result < 0)
-                return result;
-            if (child->ftype != child->inode->ftype)
-                return -EIO;
+                goto fail;
+            if (child->ftype != child->inode->ftype) {
+                result = -EIO;
+                goto fail;
+            }
+            if (child->ftype == NEWFS_DIR)
+                child->inode->parent = inode;
         }
     }
+    inode->children = children;
+    inode->children_loaded = 1;
     return 0;
-}
 
-// 加载目录树
-static int load_tree(uint32_t ino, struct newfs_inode **out) {
-    uint8_t visited[NEWFS_INODE_LIMIT] = {0};
-    return load_subtree(ino, visited, out);
+fail:
+    // 完整加载成功后才发布链表，失败时允许下一次访问重新加载
+    while (children) {
+        struct newfs_dentry *next = children->next;
+        free_tree(children->inode);
+        free(children);
+        children = next;
+    }
+    return result;
 }
 
 // 分配空闲逻辑块编号
@@ -352,6 +399,9 @@ static int lookup(const char *path, struct newfs_inode **out) {
         size_t length = strcspn(part, "/");
         if (length >= MAX_NAME_LEN)
             return -ENAMETOOLONG;
+        int result = load_directory(inode);
+        if (result < 0)
+            return result;
         struct newfs_dentry *child = inode->children;
         while (child && (strlen(child->name) != length ||
                          memcmp(child->name, part, length) != 0))
@@ -387,7 +437,7 @@ static int lookup_parent(const char *path, struct newfs_inode **parent) {
         return result;
     if ((*parent)->ftype != NEWFS_DIR)
         return -ENOTDIR;
-    return 0;
+    return load_directory(*parent);
 }
 
 // 创建目录或普通文件
@@ -449,6 +499,10 @@ static int create_node(const char *path, FILE_TYPE type) {
     // 插入 entry 并绑定 inode
     inode->ino = (uint32_t)ino;
     inode->ftype = type;
+    if (type == NEWFS_DIR) {
+        inode->children_loaded = 1;
+        inode->parent = parent;
+    }
     memcpy(entry->name, name, length + 1);
     entry->ftype = type;
     entry->inode = inode;
@@ -492,10 +546,8 @@ static void drop_dentry(struct newfs_inode *parent, struct newfs_dentry **entry)
 
 // 判断 target 是否位于 root 的目录树中，包含 root 自身
 static int contains_inode(const struct newfs_inode *root, const struct newfs_inode *target) {
-    if (root == target)
-        return 1;
-    for (struct newfs_dentry *child = root->children; child; child = child->next) {
-        if (contains_inode(child->inode, target))
+    for (const struct newfs_inode *parent = target; parent; parent = parent->parent) {
+        if (parent == root)
             return 1;
     }
     return 0;
@@ -509,8 +561,8 @@ static int sync_tree(const struct newfs_inode *inode) {
             return result;
     }
 
-    // 写回目录项
-    if (inode->ftype == NEWFS_DIR) {
+    // 只写回已加载的目录，未加载目录的盘上内容保持不变
+    if (inode->ftype == NEWFS_DIR && inode->children_loaded) {
         struct newfs_dentry *child = inode->children;
         for (uint32_t block = 0; block < inode->block_count; block++) {
             char buf[NEWFS_BLOCK_SIZE] = {0};
@@ -556,22 +608,6 @@ static int sync_tree(const struct newfs_inode *inode) {
     return write_inode(&disk_inode);
 }
 
-// 递归释放内存中的 inode 和 dentry 树
-static void free_tree(struct newfs_inode *inode) {
-    if (!inode)
-        return;
-    struct newfs_dentry *child = inode->children;
-    while (child) {
-        struct newfs_dentry *next = child->next;
-        free_tree(child->inode);
-        free(child);
-        child = next;
-    }
-    for (int i = 0; i < NEWFS_DIRECT_BLOCKS; i++)
-        free(inode->data[i]);
-    free(inode);
-}
-
 // 释放内存中的资源
 static void release_mount(void) {
     free_tree(super.root_inode);
@@ -584,7 +620,7 @@ static void release_mount(void) {
 * SECTION: 必做函数实现
 *******************************************************************************/
 /**
- * @brief 挂载文件系统，初始化空盘或恢复已有目录树。
+ * @brief 挂载文件系统，初始化空盘或加载根 inode，目录子项按需读取。
  *
  * @param conn_info FUSE 连接信息
  * @return void* 成功时返回内存超级块地址
@@ -636,6 +672,7 @@ void *newfs_init(struct fuse_conn_info *conn_info) {
         ino_map[0] = 1;
         super.root_inode->ino = 0;
         super.root_inode->ftype = NEWFS_DIR;
+        super.root_inode->children_loaded = 1;
     } else {
         // 重挂时从盘上超级块恢复布局
         super.inode_offset = disk_super.inode_offset;
@@ -651,7 +688,7 @@ void *newfs_init(struct fuse_conn_info *conn_info) {
         result = read_disk((off_t)disk_super.data_map_offset * NEWFS_BLOCK_SIZE, data_map, sizeof(data_map));
         if (result < 0)
             goto fail;
-        result = load_tree(disk_super.root_ino, &super.root_inode);
+        result = load_inode(disk_super.root_ino, &super.root_inode);
         if (result < 0)
             goto fail;
     }
@@ -781,6 +818,8 @@ int newfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t off
     int result = lookup(path, &inode);
     if (result == 0 && inode->ftype != NEWFS_DIR)
         result = -ENOTDIR;
+    if (result == 0)
+        result = load_directory(inode);
     if (result == 0) {
         off_t index = 0;
         for (struct newfs_dentry *child = inode->children; child; child = child->next, index++) {
@@ -1106,6 +1145,8 @@ int newfs_rename(const char* from, const char* to) {
         to_parent->size = to_parent->dir_cnt * sizeof(struct newfs_dentry_d);
         drop_dentry(from_parent, from_entry);
     }
+    if (inode->ftype == NEWFS_DIR)
+        inode->parent = to_parent;
     return 0;
 }
 

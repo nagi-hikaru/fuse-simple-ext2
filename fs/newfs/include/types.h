@@ -89,6 +89,8 @@ struct newfs_inode {
     uint8_t dirty[6];                 // 对应缓存块是否被修改，需要写回
 
     struct newfs_dentry *children;
+    uint8_t children_loaded;          // 目录的子项是否已加载，区别于已加载的空目录
+    struct newfs_inode *parent;       // 目录的父 inode，根目录为 NULL，用于移动时检查循环
 };
 
 struct newfs_dentry {
