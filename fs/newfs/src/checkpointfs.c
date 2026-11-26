@@ -34,7 +34,7 @@ static void parent_path(const char *path, char *parent) {
  * @note 1. 不覆盖已有目标文件；2. 若创建目标文件后复制中途失败，只清理本次新建的目标文件。
  */
 static int copy_file(const char *source, const char *target) {
-    /* TODO: 按以下步骤实现通用文件独立复制（不在此函数内编码检查点路径或创建父目录）：
+    /* 按以下步骤实现通用文件独立复制（不在此函数内编码检查点路径或创建父目录）：
      * Step 1: 调用自己的 newfs_getattr(source, &st) 检查源文件：
      *         若不存在直接返回对应负错误码；若不是普通文件（!S_ISREG(st.st_mode)）返回 -EISDIR。
      * Step 2: 确认 target 尚不存在（避免覆盖已有文件），再调用 newfs_mknod(target, S_IFREG | 0644, 0)
@@ -45,7 +45,46 @@ static int copy_file(const char *source, const char *target) {
      *         - 方法 B：直接在你自己的文件系统内部按数据块复制。
      *         注意：绝不能用硬链接代替复制！若步骤 3 中途出错，须先调用 newfs_unlink(target)
      *         清理本次新建的半成品文件，再返回负错误码。 */
-    return -ENOSYS;
+    struct stat st;
+    CHECK(newfs_getattr(source, &st));
+    if (!S_ISREG(st.st_mode))
+        return -EISDIR;
+
+    // mknod 拒绝已经存在的目标，成功后目标拥有独立 inode，才允许失败时清理
+    CHECK(newfs_mknod(target, S_IFREG | 0644, 0));
+
+    char buf[4096];
+    off_t offset = 0;
+    struct fuse_file_info fi = {0};
+    int result;
+    while (offset < st.st_size) {
+        size_t size = st.st_size - offset;
+        if (size > sizeof(buf))
+            size = sizeof(buf);
+        int count = newfs_read(source, buf, size, offset, &fi);
+        if (count <= 0 || (size_t)count > size) {
+            result = count < 0 ? count : -EIO;
+            goto fail;
+        }
+
+        // 只写实际读到的字节；发生短写时继续写完本轮，返回 0 则视为无法前进
+        size_t done = 0;
+        while (done < (size_t)count) {
+            result = newfs_write(target, buf + done, count - done, offset + done, &fi);
+            if (result <= 0 || (size_t)result > (size_t)count - done) {
+                result = result < 0 ? result : -EIO;
+                goto fail;
+            }
+            done += result;
+        }
+        offset += count;
+    }
+    return 0;
+
+fail:
+    // 这里只删除本次成功创建的半成品，不影响源文件或原本已存在的目标
+    newfs_unlink(target);
+    return result;
 }
 
 /******************************************************************************
@@ -60,7 +99,7 @@ static int copy_file(const char *source, const char *target) {
  * @return int 成功返回 0，失败返回负错误码
  */
 int checkpointfs_create(const char *source, const char *id) {
-    /* TODO: 按以下步骤保存检查点：
+    /* 按以下步骤保存检查点：
      * Step 1: 声明局部路径缓冲区（长度 CHECKPOINTFS_PATH_MAX），调用
      *         CHECK(checkpointfs_path(source, id, ckpt_path, sizeof(ckpt_path))) 生成内部存储路径，
      *         再调用上方的 parent_path(ckpt_path, dir_path) 取得该文件专属的检查点集合目录。
@@ -69,7 +108,22 @@ int checkpointfs_create(const char *source, const char *id) {
      *         - 若返回 -ENOENT，调用 newfs_mkdir(dir_path, 0755) 创建集合目录；
      *         - 若已存在但不是目录（!S_ISDIR），返回 -ENOTDIR。
      * Step 3: 调用 copy_file(source, ckpt_path) 将工作文件独立复制到检查点路径并返回结果。 */
-    return -ENOSYS;
+    char ckpt_path[CHECKPOINTFS_PATH_MAX];
+    char dir_path[CHECKPOINTFS_PATH_MAX];
+    CHECK(checkpointfs_path(source, id, ckpt_path, sizeof(ckpt_path)));
+    parent_path(ckpt_path, dir_path);
+
+    // 创建当前工作文件对应的检查点集合目录
+    struct stat st;
+    int result = newfs_getattr(dir_path, &st);
+    if (result == -ENOENT) {
+        CHECK(newfs_mkdir(dir_path, 0755));
+    } else if (result < 0) {
+        return result;
+    } else if (!S_ISDIR(st.st_mode)) {
+        return -ENOTDIR;
+    }
+    return copy_file(source, ckpt_path);
 }
 
 /**
@@ -82,12 +136,16 @@ int checkpointfs_create(const char *source, const char *id) {
  */
 int checkpointfs_copy(const char *source, const char *source_id,
                       const char *target_id) {
-    /* TODO: 按以下步骤复制同一集合内的检查点（不改动工作文件 source）：
+    /* 按以下步骤复制同一集合内的检查点（不改动工作文件 source）：
      * Step 1: 声明两个长度为 CHECKPOINTFS_PATH_MAX 的局部路径缓冲区，以同一个 source 为第一个参数，
      *         分别调用 checkpointfs_path(source, source_id, ...) 和 checkpointfs_path(source, target_id, ...)
      *         得到源检查点和目标检查点的内部真实路径。
      * Step 2: 直接调用 copy_file(src_ckpt_path, dst_ckpt_path) 完成独立复制并返回结果。 */
-    return -ENOSYS;
+    char src_path[CHECKPOINTFS_PATH_MAX];
+    char dst_path[CHECKPOINTFS_PATH_MAX];
+    CHECK(checkpointfs_path(source, source_id, src_path, sizeof(src_path)));
+    CHECK(checkpointfs_path(source, target_id, dst_path, sizeof(dst_path)));
+    return copy_file(src_path, dst_path);
 }
 
 /**
@@ -102,7 +160,7 @@ int checkpointfs_copy(const char *source, const char *source_id,
  */
 int checkpointfs_restore(const char *source, const char *hist_id,
                          const char *new_id) {
-    /* TODO: 按以下步骤安全恢复工作文件：
+    /* 按以下步骤安全恢复工作文件：
      * Step 1: 调用 newfs_getattr(source, &st) 检查工作文件 source 是否存在且为普通文件
      *         （若为目录返回 -EISDIR，不存在则返回对应错误码，不要在 source 非法时创建新检查点）。
      * Step 2: 调用 CHECK(checkpointfs_copy(source, hist_id, new_id)) 将历史检查点独立复制为新检查点；
@@ -110,5 +168,16 @@ int checkpointfs_restore(const char *source, const char *hist_id,
      * Step 3: 用 checkpointfs_path(source, new_id, new_ckpt_path, sizeof(new_ckpt_path)) 取得新检查点路径，
      *         先调用 CHECK(newfs_unlink(source)) 移除旧工作路径目录项，
      *         再调用 newfs_link(new_ckpt_path, source) 让工作路径硬链接到新检查点。 */
-    return -ENOSYS;
+    struct stat st;
+    CHECK(newfs_getattr(source, &st));
+    if (!S_ISREG(st.st_mode))
+        return -EISDIR;
+
+    char new_ckpt_path[CHECKPOINTFS_PATH_MAX];
+    CHECK(checkpointfs_path(source, new_id, new_ckpt_path, sizeof(new_ckpt_path)));
+    // 先独立复制历史，复制失败时工作文件不变
+    CHECK(checkpointfs_copy(source, hist_id, new_id));
+    CHECK(newfs_unlink(source));
+    // 工作路径与新分支共享 inode
+    return newfs_link(new_ckpt_path, source);
 }
