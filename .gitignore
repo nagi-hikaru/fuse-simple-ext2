@@ -1,0 +1,30 @@
+# CMake build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Compiled objects and generated user-mode driver
+*.o
+/driver/user_ddriver/bin/
+
+# Demo test disk image
+/fs/demo/tests/disk2
+
+# Test mount points and temporary bonus test directories
+/fs/*/tests/mnt/
+/fs/*/tests/test_mnt/
+/fs/*/tests/.lab5-test-*/
+
+# Driver disk dumps and runtime logs
+ddriver_dump
+disk_dump
+ddriver_log
+*.log
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
