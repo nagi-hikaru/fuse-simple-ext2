@@ -11,7 +11,8 @@ struct custom_options {
 
 typedef enum {
     NEWFS_FILE,   // 普通文件
-    NEWFS_DIR     // 目录文件
+    NEWFS_DIR,    // 目录文件
+    NEWFS_SYMLINK // 符号链接，数据块中保存目标路径
 } FILE_TYPE;
 
 /* to-Disk */
@@ -46,7 +47,7 @@ struct newfs_inode_d {
     uint32_t block_count;
     int data_block[6];     // 数据区内的相对块号，前 block_count 个槽位有效
 
-    uint32_t link;         // 链接数；本实验必做部分不要求专门处理，通常可默认为 1
+    uint32_t link;         // 硬链接计数，最后一个名字删除后才能回收 inode
 };
 
 struct newfs_dentry_d {
@@ -75,10 +76,12 @@ struct newfs_super {
     uint8_t *ino_map;                // 指向内存中的 inode 位图
     uint8_t *data_map;               // 指向内存中的数据块位图
     struct newfs_inode *root_inode;  // 指向已读入内存的根 inode，供路径查找使用
+    struct newfs_inode **inode_cache;// 按编号缓存 inode，各目录项共享同一对象
 };
 
 struct newfs_inode {
     uint32_t ino;
+    uint32_t link;                    // 硬链接计数，与盘上 inode 保持一致
     FILE_TYPE ftype;
     int dir_cnt;
 

@@ -37,6 +37,9 @@ static struct fuse_operations operations = {
 	.unlink = newfs_unlink,					 /* 删除文件 */
 	.rmdir = newfs_rmdir,					 /* 删除空目录 */
 	.rename = newfs_rename,					 /* 重命名，mv */
+	.link = newfs_link,                      /* 硬链接，ln */
+	.symlink = newfs_symlink,                /* 符号链接，ln -s */
+	.readlink = newfs_readlink,              /* 读取符号链接目标 */
 
 	.open = newfs_open,
 	.opendir = newfs_opendir,
@@ -152,14 +155,13 @@ static int load_file_block(struct newfs_inode *inode, uint32_t block) {
     return 0;
 }
 
-// 递归释放内存中的 inode 和 dentry 树
-static void free_tree(struct newfs_inode *inode) {
+// 释放一个 inode 的内存
+static void free_inode_memory(struct newfs_inode *inode) {
     if (!inode)
         return;
     struct newfs_dentry *child = inode->children;
     while (child) {
         struct newfs_dentry *next = child->next;
-        free_tree(child->inode);
         free(child);
         child = next;
     }
@@ -173,6 +175,10 @@ static int load_inode(uint32_t ino, struct newfs_inode **out) {
     if (ino >= (uint32_t)super.ino_max ||
         !(super.ino_map[ino / 8] & (1u << (ino % 8))))
         return -EIO;
+    if (super.inode_cache[ino]) {
+        *out = super.inode_cache[ino];
+        return 0;
+    }
 
     // 读取对应 inode
     struct newfs_inode_d disk_inode;
@@ -180,11 +186,12 @@ static int load_inode(uint32_t ino, struct newfs_inode **out) {
     if (result < 0)
         return result;
     if (disk_inode.ino != ino ||
-        (disk_inode.ftype != NEWFS_FILE && disk_inode.ftype != NEWFS_DIR) ||
+        (disk_inode.ftype != NEWFS_FILE && disk_inode.ftype != NEWFS_DIR &&
+         disk_inode.ftype != NEWFS_SYMLINK) || disk_inode.link == 0 ||
         disk_inode.block_count > NEWFS_DIRECT_BLOCKS ||
         disk_inode.size > (uint32_t)super.file_max || disk_inode.dir_cnt < 0 ||
         (uint32_t)disk_inode.dir_cnt > disk_inode.block_count * NEWFS_DENTRIES_PER_BLOCK ||
-        (disk_inode.ftype == NEWFS_FILE &&
+        (disk_inode.ftype != NEWFS_DIR &&
          (disk_inode.dir_cnt != 0 ||
           disk_inode.size > disk_inode.block_count * NEWFS_BLOCK_SIZE)))
         return -EIO;
@@ -202,11 +209,13 @@ static int load_inode(uint32_t ino, struct newfs_inode **out) {
         return -ENOMEM;
     *out = inode;
     inode->ino = disk_inode.ino;
+    inode->link = disk_inode.link;
     inode->ftype = disk_inode.ftype;
     inode->dir_cnt = disk_inode.dir_cnt;
     inode->size = disk_inode.size;
     inode->block_count = disk_inode.block_count;
     memcpy(inode->data_block, disk_inode.data_block, sizeof(inode->data_block));
+    super.inode_cache[ino] = inode;
     return 0;
 }
 
@@ -265,8 +274,20 @@ static int load_directory(struct newfs_inode *inode) {
                 result = -EIO;
                 goto fail;
             }
-            if (child->ftype == NEWFS_DIR)
+            // 不允许目录有硬连接
+            if (child->ftype == NEWFS_DIR) {
+                if (child->inode->parent && child->inode->parent != inode) {
+                    result = -EIO;
+                    goto fail;
+                }
+                for (struct newfs_dentry *other = children; other != child; other = other->next) {
+                    if (other->inode == child->inode) {
+                        result = -EIO;
+                        goto fail;
+                    }
+                }
                 child->inode->parent = inode;
+            }
         }
     }
     inode->children = children;
@@ -277,7 +298,6 @@ fail:
     // 完整加载成功后才发布链表，失败时允许下一次访问重新加载
     while (children) {
         struct newfs_dentry *next = children->next;
-        free_tree(children->inode);
         free(children);
         children = next;
     }
@@ -441,7 +461,7 @@ static int lookup_parent(const char *path, struct newfs_inode **parent) {
 }
 
 // 创建目录或普通文件
-static int create_node(const char *path, FILE_TYPE type) {
+static int create_node(const char *path, FILE_TYPE type, struct newfs_inode **created) {
     if (!path || path[0] != '/')
         return -EINVAL;
     const char *name = strrchr(path, '/') + 1;
@@ -498,6 +518,7 @@ static int create_node(const char *path, FILE_TYPE type) {
 
     // 插入 entry 并绑定 inode
     inode->ino = (uint32_t)ino;
+    inode->link = 1;
     inode->ftype = type;
     if (type == NEWFS_DIR) {
         inode->children_loaded = 1;
@@ -509,6 +530,9 @@ static int create_node(const char *path, FILE_TYPE type) {
     *tail = entry;
     parent->dir_cnt++;
     parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
+    super.inode_cache[ino] = inode;
+    if (created)
+        *created = inode;
     return 0;
 }
 
@@ -521,9 +545,14 @@ static void drop_inode(struct newfs_inode *inode) {
     }
     // 归还 inode 位图
     super.ino_map[inode->ino / 8] &= (uint8_t)~(1u << (inode->ino % 8));
-    for (int i = 0; i < NEWFS_DIRECT_BLOCKS; i++)
-        free(inode->data[i]);
-    free(inode);
+    super.inode_cache[inode->ino] = NULL;
+    free_inode_memory(inode);
+}
+
+// 最后一个硬链接消失时才真正回收资源
+static void drop_link(struct newfs_inode *inode) {
+    if (--inode->link == 0)
+        drop_inode(inode);
 }
 
 // entry 指向链表中保存目标目录项指针的位置，只移除目录项，不释放 inode
@@ -553,14 +582,8 @@ static int contains_inode(const struct newfs_inode *root, const struct newfs_ino
     return 0;
 }
 
-// 同步目录树
-static int sync_tree(const struct newfs_inode *inode) {
-    for (struct newfs_dentry *child = inode->children; child; child = child->next) {
-        int result = sync_tree(child->inode);
-        if (result < 0)
-            return result;
-    }
-
+// 同步一个 inode，目录子项与文件内容仍按原有缓存方式写回
+static int sync_inode(const struct newfs_inode *inode) {
     // 只写回已加载的目录，未加载目录的盘上内容保持不变
     if (inode->ftype == NEWFS_DIR && inode->children_loaded) {
         struct newfs_dentry *child = inode->children;
@@ -583,7 +606,7 @@ static int sync_tree(const struct newfs_inode *inode) {
     }
 
     // 普通文件只写回修改过的块，未加载且未改变的块保持盘上内容
-    else if (inode->ftype == NEWFS_FILE) {
+    else if (inode->ftype != NEWFS_DIR) {
         for (uint32_t block = 0; block < inode->block_count; block++) {
             if (!inode->dirty[block])
                 continue;
@@ -602,15 +625,34 @@ static int sync_tree(const struct newfs_inode *inode) {
         .dir_cnt = inode->dir_cnt,
         .size = inode->size,
         .block_count = inode->block_count,
-        .link = inode == super.root_inode ? 2 : 1
+        .link = inode->link
     };
     memcpy(disk_inode.data_block, inode->data_block, sizeof(disk_inode.data_block));
     return write_inode(&disk_inode);
 }
 
+// 按缓存同步，避免硬链接重复写回，也不会漏掉仅被未加载目录引用的 inode
+static int sync_tree(void) {
+    for (int directory = 0; directory <= 1; directory++) {
+        for (int ino = 0; ino < super.ino_max; ino++) {
+            struct newfs_inode *inode = super.inode_cache[ino];
+            if (!inode || (inode->ftype == NEWFS_DIR) != directory)
+                continue;
+            int result = sync_inode(inode);
+            if (result < 0)
+                return result;
+        }
+    }
+    return 0;
+}
+
 // 释放内存中的资源
 static void release_mount(void) {
-    free_tree(super.root_inode);
+    if (super.inode_cache) {
+        for (int ino = 0; ino < super.ino_max; ino++)
+            free_inode_memory(super.inode_cache[ino]);
+        free(super.inode_cache);
+    }
     if (super.fd >= 0)
         ddriver_close(super.fd);
     super = (struct newfs_super) { .fd = -1 };
@@ -653,7 +695,8 @@ void *newfs_init(struct fuse_conn_info *conn_info) {
         goto fail;
 
     // 第一次挂载直接初始化内存中的超级块、位图和根目录
-    if (disk_super.magic_number != NEWFS_MAGIC) {
+    int first_mount = disk_super.magic_number != NEWFS_MAGIC;
+    if (first_mount) {
         super.inode_offset = 3;
         super.inode_blks = NEWFS_INODE_BLOCKS;
         super.data_offset = 3 + NEWFS_INODE_BLOCKS;
@@ -664,15 +707,6 @@ void *newfs_init(struct fuse_conn_info *conn_info) {
         memset(ino_map, 0, sizeof(ino_map));
         memset(data_map, 0, sizeof(data_map));
 
-        super.root_inode = calloc(1, sizeof(*super.root_inode));
-        if (!super.root_inode) {
-            result = -ENOMEM;
-            goto fail;
-        }
-        ino_map[0] = 1;
-        super.root_inode->ino = 0;
-        super.root_inode->ftype = NEWFS_DIR;
-        super.root_inode->children_loaded = 1;
     } else {
         // 重挂时从盘上超级块恢复布局
         super.inode_offset = disk_super.inode_offset;
@@ -688,6 +722,29 @@ void *newfs_init(struct fuse_conn_info *conn_info) {
         result = read_disk((off_t)disk_super.data_map_offset * NEWFS_BLOCK_SIZE, data_map, sizeof(data_map));
         if (result < 0)
             goto fail;
+    }
+    if (super.ino_max <= 0 || super.ino_max > NEWFS_INODE_LIMIT) {
+        result = -EINVAL;
+        goto fail;
+    }
+    super.inode_cache = calloc(super.ino_max, sizeof(*super.inode_cache));
+    if (!super.inode_cache) {
+        result = -ENOMEM;
+        goto fail;
+    }
+    if (first_mount) {
+        super.root_inode = calloc(1, sizeof(*super.root_inode));
+        if (!super.root_inode) {
+            result = -ENOMEM;
+            goto fail;
+        }
+        ino_map[0] = 1;
+        super.root_inode->ino = 0;
+        super.root_inode->link = 2;
+        super.root_inode->ftype = NEWFS_DIR;
+        super.root_inode->children_loaded = 1;
+        super.inode_cache[0] = super.root_inode;
+    } else {
         result = load_inode(disk_super.root_ino, &super.root_inode);
         if (result < 0)
             goto fail;
@@ -739,7 +796,7 @@ void newfs_destroy(void *p) {
             result = write_disk((off_t)disk_super.data_map_offset * NEWFS_BLOCK_SIZE, super.data_map, NEWFS_BLOCK_SIZE);
         // 写回文件树
         if (result == 0) 
-            result = sync_tree(super.root_inode);
+            result = sync_tree();
         // 让操作系统将缓存同步到底层存储
         if (result == 0 && fsync(super.fd) < 0)
             result = -errno;
@@ -757,7 +814,7 @@ void newfs_destroy(void *p) {
  */
 int newfs_mkdir(const char *path, mode_t mode) {
     (void)mode;
-    int result = create_node(path, NEWFS_DIR);
+    int result = create_node(path, NEWFS_DIR, NULL);
     return result;
 }
 
@@ -772,7 +829,7 @@ int newfs_mknod(const char *path, mode_t mode, dev_t dev) {
     (void)dev;
     if ((mode & S_IFMT) && !S_ISREG(mode))
         return -EINVAL;
-    int result = create_node(path, NEWFS_FILE);
+    int result = create_node(path, NEWFS_FILE, NULL);
     return result;
 }
 
@@ -788,8 +845,9 @@ int newfs_getattr(const char *path, struct stat *stat) {
     if (result == 0) {
         memset(stat, 0, sizeof(*stat));
         stat->st_ino = inode->ino;
-        stat->st_mode = (inode->ftype == NEWFS_DIR ? S_IFDIR : S_IFREG) | NEWFS_DEFAULT_PERM;
-        stat->st_nlink = inode == super.root_inode ? 2 : 1;
+        stat->st_mode = (inode->ftype == NEWFS_DIR ? S_IFDIR :
+                         inode->ftype == NEWFS_SYMLINK ? S_IFLNK : S_IFREG) | NEWFS_DEFAULT_PERM;
+        stat->st_nlink = inode->link;
         stat->st_uid = getuid();
         stat->st_gid = getgid();
         stat->st_size = inode->size;
@@ -865,6 +923,8 @@ int newfs_write(const char* path, const char* buf, size_t size, off_t offset,
         return result;
     if (inode->ftype == NEWFS_DIR)
         return -EISDIR;
+    if (inode->ftype == NEWFS_SYMLINK)
+        return -ELOOP;
     if (offset < 0)
         return -EINVAL;
     if (size == 0)
@@ -934,6 +994,8 @@ int newfs_read(const char* path, char* buf, size_t size, off_t offset,
         return result;
     if (inode->ftype == NEWFS_DIR)
         return -EISDIR;
+    if (inode->ftype == NEWFS_SYMLINK)
+        return -ELOOP;
     if (offset < 0)
         return -EINVAL;
     if (size == 0 || offset >= inode->size)
@@ -960,7 +1022,143 @@ int newfs_read(const char* path, char* buf, size_t size, off_t offset,
 }
 
 /**
- * @brief 删除普通文件，移除目录项并回收 inode 和数据块。
+ * @brief 创建硬链接，只增加目录项和链接计数，不复制 inode 或文件内容。
+ * @param from 已存在的非目录路径
+ * @param to 新链接的绝对路径
+ * @return int 成功返回 0，失败返回负错误码
+ */
+int newfs_link(const char *from, const char *to) {
+    struct newfs_inode *inode;
+    int result = lookup(from, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype == NEWFS_DIR)
+        return -EPERM;
+    if (inode->link == UINT32_MAX)
+        return -EMLINK;
+    if (!to || to[0] != '/')
+        return -EINVAL;
+    const char *name = strrchr(to, '/') + 1;
+    size_t length = strlen(name);
+    if (!length)
+        return -EEXIST;
+    if (length >= MAX_NAME_LEN)
+        return -ENAMETOOLONG;
+    if (!strcmp(name, ".") || !strcmp(name, ".."))
+        return -EINVAL;
+
+    struct newfs_inode *parent;
+    result = lookup_parent(to, &parent);
+    if (result < 0)
+        return result;
+    struct newfs_dentry **tail = &parent->children;
+    while (*tail) {
+        if (!strcmp((*tail)->name, name))
+            return -EEXIST;
+        tail = &(*tail)->next;
+    }
+    if (parent->dir_cnt >= NEWFS_DIRECT_BLOCKS * NEWFS_DENTRIES_PER_BLOCK)
+        return -ENOSPC;
+    struct newfs_dentry *entry = calloc(1, sizeof(*entry));
+    if (!entry)
+        return -ENOMEM;
+    if (parent->dir_cnt % NEWFS_DENTRIES_PER_BLOCK == 0) {
+        int block = alloc_bitmap(super.data_map, super.data_blks);
+        if (block < 0) {
+            free(entry);
+            return block;
+        }
+        parent->data_block[parent->block_count++] = block;
+    }
+    memcpy(entry->name, name, length + 1);
+    entry->ftype = inode->ftype;
+    entry->inode = inode;
+    *tail = entry;
+    parent->dir_cnt++;
+    parent->size = parent->dir_cnt * sizeof(struct newfs_dentry_d);
+    inode->link++;
+    return 0;
+}
+
+/**
+ * @brief 创建符号链接，将目标路径原样保存到独立 inode 的数据块中。
+ * @param target 目标路径，可以是相对路径或尚不存在的路径
+ * @param linkpath 新链接的绝对路径
+ * @return int 成功返回 0，失败返回负错误码
+ */
+int newfs_symlink(const char *target, const char *linkpath) {
+    if (!target)
+        return -EINVAL;
+    size_t size = strlen(target);
+    if (!size)
+        return -ENOENT;
+    if (size > (size_t)super.file_max)
+        return -ENAMETOOLONG;
+    struct newfs_inode *parent;
+    int result = lookup_parent(linkpath, &parent);
+    if (result < 0)
+        return result;
+    struct newfs_inode *inode;
+    result = create_node(linkpath, NEWFS_SYMLINK, &inode);
+    if (result < 0)
+        return result;
+    result = resize_file(inode, (uint32_t)size);
+    if (result < 0) {
+        // 父目录已经加载，直接撤销刚创建的目录项
+        struct newfs_dentry **entry = &parent->children;
+        while ((*entry)->inode != inode)
+            entry = &(*entry)->next;
+        drop_dentry(parent, entry);
+        drop_link(inode);
+        return result;
+    }
+    for (uint32_t block = 0; block < inode->block_count; block++) {
+        size_t start = block * NEWFS_BLOCK_SIZE;
+        size_t count = size - start;
+        if (count > NEWFS_BLOCK_SIZE)
+            count = NEWFS_BLOCK_SIZE;
+        memcpy(inode->data[block], target + start, count);
+    }
+    return 0;
+}
+
+/**
+ * @brief 读取符号链接保存的目标路径，最多复制 size-1 字节并补字符串结束符。
+ * @param path 链接自身的绝对路径
+ * @param buf 目标路径缓冲区
+ * @param size 缓冲区大小，包含字符串结束符
+ * @return int 成功返回 0，失败返回负错误码
+ */
+int newfs_readlink(const char *path, char *buf, size_t size) {
+    if (!buf || size == 0)
+        return -EINVAL;
+    struct newfs_inode *inode;
+    int result = lookup(path, &inode);
+    if (result < 0)
+        return result;
+    if (inode->ftype != NEWFS_SYMLINK)
+        return -EINVAL;
+    size_t count = inode->size;
+    if (count >= size)
+        count = size - 1;
+    size_t done = 0;
+    while (done < count) {
+        uint32_t block = done / NEWFS_BLOCK_SIZE;
+        result = load_file_block(inode, block);
+        if (result < 0)
+            return result;
+        size_t bytes = count - done;
+        if (bytes > NEWFS_BLOCK_SIZE)
+            bytes = NEWFS_BLOCK_SIZE;
+        memcpy(buf + done, inode->data[block], bytes);
+        done += bytes;
+    }
+    buf[count] = '\0';
+    return 0;
+}
+
+/**
+ * @brief 删除文件名或符号链接，最后一个硬链接消失时回收 inode 和数据块。
  * @param path 相对于文件系统根目录的绝对路径
  * @return int 成功返回 0，失败返回负错误码
  */
@@ -986,7 +1184,7 @@ int newfs_unlink(const char* path) {
         return -ENOENT;
 
     drop_dentry(parent, entry);
-    drop_inode(inode);
+    drop_link(inode);
     return 0;
 }
 
@@ -1108,7 +1306,7 @@ int newfs_rename(const char* from, const char* to) {
         if (target) {
             struct newfs_inode *old_inode = target->inode;
             drop_dentry(to_parent, to_entry);
-            drop_inode(old_inode);
+            drop_link(old_inode);
         }
         memcpy(source->name, to_name, to_length);
         source->name[to_length] = '\0';
@@ -1119,8 +1317,9 @@ int newfs_rename(const char* from, const char* to) {
         // 跨目录覆盖时，复用目标目录项，回收旧目标的 inode
         struct newfs_inode *old_inode = target->inode;
         target->inode = inode;
+        target->ftype = source->ftype;
         drop_dentry(from_parent, from_entry);
-        drop_inode(old_inode);
+        drop_link(old_inode);
     } else {
         if (to_parent->dir_cnt >= NEWFS_DIRECT_BLOCKS * NEWFS_DENTRIES_PER_BLOCK)
             return -ENOSPC;
@@ -1164,6 +1363,8 @@ int newfs_open(const char* path, struct fuse_file_info* fi) {
         return result;
     if (inode->ftype == NEWFS_DIR)
         return -EISDIR;
+    if (inode->ftype == NEWFS_SYMLINK)
+        return -ELOOP;
     return 0;
 }
 
@@ -1197,6 +1398,8 @@ int newfs_truncate(const char* path, off_t offset) {
         return result;
     if (inode->ftype == NEWFS_DIR)
         return -EISDIR;
+    if (inode->ftype == NEWFS_SYMLINK)
+        return -ELOOP;
     if (offset < 0)
         return -EINVAL;
     if (offset > super.file_max)

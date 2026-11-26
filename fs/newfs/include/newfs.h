@@ -45,6 +45,9 @@ int   			   newfs_access(const char *, int);
 int   			   newfs_unlink(const char *);
 int   			   newfs_rmdir(const char *);
 int   			   newfs_rename(const char *, const char *);
+int                newfs_link(const char *, const char *);
+int                newfs_symlink(const char *, const char *);
+int                newfs_readlink(const char *, char *, size_t);
 int   			   newfs_utimens(const char *, const struct timespec tv[2]);
 int   			   newfs_truncate(const char *, off_t);
 			
